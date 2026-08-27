@@ -1,6 +1,7 @@
 use crate::error::PoolError;
 use crate::worker::{Job, Worker};
 use crossbeam_deque::Injector;
+use event_listener::Event;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -9,9 +10,9 @@ use std::sync::{
 pub struct WorkerPool {
     injector: Arc<Injector<Job>>,
     workers: Vec<Worker>,
+    work_available: Arc<Event>,
     shutdown: Arc<AtomicBool>,
     pending: Arc<AtomicUsize>,
-    next_worker: AtomicUsize,
 }
 
 impl WorkerPool {
@@ -20,6 +21,7 @@ impl WorkerPool {
             return Err(PoolError::InvalidSize);
         }
         let injector = Arc::new(Injector::new());
+        let work_available = Arc::new(Event::new());
         let mut stealers = Vec::with_capacity(size);
         let locals = (0..size)
             .map(|_| {
@@ -38,6 +40,7 @@ impl WorkerPool {
                     local,
                     Arc::clone(&injector),
                     Arc::clone(&stealers),
+                    Arc::clone(&work_available),
                     Arc::clone(&shutdown),
                     Arc::clone(&pending),
                 )
@@ -46,9 +49,9 @@ impl WorkerPool {
         Ok(Self {
             injector,
             workers,
+            work_available,
             shutdown,
             pending,
-            next_worker: AtomicUsize::new(0),
         })
     }
 
@@ -61,8 +64,7 @@ impl WorkerPool {
         }
         self.pending.fetch_add(1, Ordering::Release);
         self.injector.push(Box::new(job));
-        let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        self.workers[index].handle.unpark();
+        self.work_available.notify(1);
         Ok(())
     }
 
@@ -74,9 +76,7 @@ impl WorkerPool {
 impl Drop for WorkerPool {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        for worker in &self.workers {
-            worker.handle.unpark();
-        }
+        self.work_available.notify(usize::MAX);
         for worker in &mut self.workers {
             if let Some(join) = worker.join.take() {
                 let _ = join.join();
@@ -89,8 +89,9 @@ impl Drop for WorkerPool {
 mod tests {
     use super::WorkerPool;
     use crate::PoolError;
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex, atomic::Ordering, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn rejects_zero_workers() {
@@ -137,5 +138,55 @@ mod tests {
         }
         drop(tx);
         assert_eq!(rx.iter().count(), 20);
+    }
+
+    #[test]
+    fn executes_new_work_while_another_worker_is_busy() {
+        let pool = WorkerPool::new(2).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        pool.execute(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        pool.execute(move || done_tx.send(()).unwrap()).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn drop_completes_after_the_last_running_job() {
+        let pool = WorkerPool::new(2).unwrap();
+        let shutdown = Arc::clone(&pool.shutdown);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+
+        pool.execute(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let drop_thread = thread::spawn(move || {
+            drop(pool);
+            dropped_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !shutdown.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "Drop did not begin in time");
+            thread::yield_now();
+        }
+
+        release_tx.send(()).unwrap();
+        dropped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop_thread.join().unwrap();
     }
 }
