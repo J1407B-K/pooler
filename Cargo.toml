@@ -9,3 +9,7 @@ readme = "README.md"
 [dependencies]
 crossbeam-deque = "0.8"
 event-listener = "5.4"
+
+[[bench]]
+name = "throughput"
+harness = false

@@ -1,9 +1,10 @@
+use crate::pool::Metrics;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker as LocalWorker};
 use event_listener::{Event, Listener, listener};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 
@@ -20,10 +21,10 @@ impl Worker {
         stealers: Arc<Vec<Stealer<Job>>>,
         work_available: Arc<Event>,
         shutdown: Arc<AtomicBool>,
-        pending: Arc<AtomicUsize>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         let join = thread::spawn(move || {
-            worker_loop(local, injector, stealers, work_available, shutdown, pending)
+            worker_loop(local, injector, stealers, work_available, shutdown, metrics)
         });
         Self { join: Some(join) }
     }
@@ -35,11 +36,11 @@ fn worker_loop(
     stealers: Arc<Vec<Stealer<Job>>>,
     work_available: Arc<Event>,
     shutdown: Arc<AtomicBool>,
-    pending: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
 ) {
     loop {
         if let Some(job) = next_job(&local, &injector, &stealers) {
-            run_job(job, &pending, &shutdown, &work_available);
+            run_job(job, &metrics, &shutdown, &work_available);
             continue;
         }
 
@@ -48,7 +49,7 @@ fn worker_loop(
 
             if let Some(job) = next_job(&local, &injector, &stealers) {
                 Some(job)
-            } else if should_stop(&shutdown, &pending) {
+            } else if should_stop(&shutdown, &metrics) {
                 return;
             } else {
                 listener.wait();
@@ -57,7 +58,7 @@ fn worker_loop(
         };
 
         if let Some(job) = job {
-            run_job(job, &pending, &shutdown, &work_available);
+            run_job(job, &metrics, &shutdown, &work_available);
         }
     }
 }
@@ -94,13 +95,16 @@ fn steal_from_others(stealers: &[Stealer<Job>]) -> Steal<Job> {
     stealers.iter().map(Stealer::steal).collect()
 }
 
-fn run_job(job: Job, pending: &AtomicUsize, shutdown: &AtomicBool, work_available: &Event) {
-    let _ = panic::catch_unwind(AssertUnwindSafe(job));
-    if pending.fetch_sub(1, Ordering::AcqRel) == 1 && shutdown.load(Ordering::Acquire) {
+fn run_job(job: Job, metrics: &Metrics, shutdown: &AtomicBool, work_available: &Event) {
+    if panic::catch_unwind(AssertUnwindSafe(job)).is_err() {
+        metrics.panicked.fetch_add(1, Ordering::Relaxed);
+    }
+    metrics.completed.fetch_add(1, Ordering::Relaxed);
+    if metrics.pending.fetch_sub(1, Ordering::AcqRel) == 1 && shutdown.load(Ordering::Acquire) {
         work_available.notify(usize::MAX);
     }
 }
 
-fn should_stop(shutdown: &AtomicBool, pending: &AtomicUsize) -> bool {
-    shutdown.load(Ordering::Acquire) && pending.load(Ordering::Acquire) == 0
+fn should_stop(shutdown: &AtomicBool, metrics: &Metrics) -> bool {
+    shutdown.load(Ordering::Acquire) && metrics.pending.load(Ordering::Acquire) == 0
 }
